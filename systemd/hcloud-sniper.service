@@ -1,0 +1,14 @@
+[Unit]
+Description=Hetzner Cloud server-type sniper
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/hcloud-sniper.env
+ExecStart=/usr/bin/python3 /opt/hcloud-sniper/sniper.py
+Restart=on-failure
+RestartSec=60
+
+[Install]
+WantedBy=multi-user.target
