@@ -30,10 +30,10 @@ CREATED = {"server": {"id": 4711, "name": "test-node",
            "root_password": "s3cret"}
 
 
-def http_error(code, error_code):
+def http_error(code, error_code, headers=None):
     body = json.dumps({"error": {"code": error_code, "message": error_code}}).encode()
     return urllib.error.HTTPError("https://api.hetzner.cloud/v1/servers", code,
-                                  error_code, {}, io.BytesIO(body))
+                                  error_code, headers or {}, io.BytesIO(body))
 
 
 class LoopTest(unittest.TestCase):
@@ -75,13 +75,26 @@ class LoopTest(unittest.TestCase):
         self.assertEqual([m for m, _ in self.calls()], ["GET", "POST", "GET", "POST"])
         self.sleep.assert_called_once_with(45)  # normal interval, no backoff
 
-    def test_rate_limit_backs_off(self):
+    def test_rate_limit_backs_off_once(self):
         self.req.side_effect = [http_error(429, "rate_limit_exceeded"),
                                 types_body(["fsn1"]), CREATED]
 
         self.assertEqual(Sniper().run(), 0)
 
-        self.assertEqual(self.sleep.call_args_list, [mock.call(300), mock.call(45)])
+        # one backoff, and no extra interval nap stacked on top of it
+        self.assertEqual(self.sleep.call_args_list, [mock.call(60)])
+
+    def test_low_budget_stretches_the_nap(self):
+        self.req.side_effect = [
+            http_error(429, "rate_limit_exceeded", {"RateLimit-Remaining": "12"}),
+            types_body([]), LoopBreak]
+
+        with mock.patch.dict(os.environ, {**ENV, "HC_INTERVAL": "5"}, clear=True):
+            with self.assertRaises(LoopBreak):
+                Sniper().run()
+
+        # a 5s poll backs off to 30s while the budget is nearly spent
+        self.assertEqual(self.sleep.call_args_list, [mock.call(60), mock.call(30)])
 
     def test_five_consecutive_http_errors_notify_once(self):
         self.req.side_effect = [http_error(403, "resource_limit_exceeded")] * 6 + [LoopBreak]
@@ -104,6 +117,32 @@ class LoopTest(unittest.TestCase):
 
         with self.assertRaises(SystemExit):  # not caught by the loop's except Exception
             Sniper().run()
+
+
+class BudgetTest(unittest.TestCase):
+    def setUp(self):
+        self.enterContext(mock.patch.dict(os.environ, ENV, clear=True))
+        self.enterContext(mock.patch("sys.stdout", new_callable=io.StringIO))
+        self.sleep = self.enterContext(mock.patch("sniper.time.sleep"))
+        self.s = Sniper()
+
+    def test_full_budget_uses_the_interval(self):
+        self.s.remaining = 3000
+        self.s.wait()
+        self.sleep.assert_called_once_with(45)
+
+    def test_unknown_budget_uses_the_interval(self):
+        self.s.wait()
+        self.sleep.assert_called_once_with(45)
+
+    def test_headers_without_the_limit_are_ignored(self):
+        self.s.note_limits({"Content-Type": "application/json"})
+        self.s.note_limits(None)
+        self.assertIsNone(self.s.remaining)
+
+    def test_interval_floor_is_one_second(self):
+        with mock.patch.dict(os.environ, {**ENV, "HC_INTERVAL": "0"}, clear=True):
+            self.assertEqual(Sniper().interval, 1)
 
 
 class NotifyTest(unittest.TestCase):

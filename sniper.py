@@ -31,8 +31,11 @@ class Sniper:
         self.name = os.environ.get("HC_NAME", "cx33-node")
         self.image = os.environ.get("HC_IMAGE", "debian-13")
         self.ssh_keys = env_list("HC_SSH_KEYS", "")
-        self.interval = int(os.environ.get("HC_INTERVAL", "45"))
+        self.interval = max(1, int(os.environ.get("HC_INTERVAL", "5")))
+        self.reserve = int(os.environ.get("HC_RESERVE", "600"))
+        self.backoff = int(os.environ.get("HC_BACKOFF", "60"))
         self.slack_webhook = os.environ.get("SLACK_WEBHOOK")
+        self.remaining = None  # RateLimit-Remaining from the last response
 
     # --- HTTP -------------------------------------------------------------
     def req(self, method, path, body=None):
@@ -43,7 +46,23 @@ class Sniper:
                      "Content-Type": "application/json"},
         )
         with urllib.request.urlopen(r, timeout=20) as resp:
+            self.note_limits(resp.headers)
             return json.load(resp)
+
+    def note_limits(self, headers):
+        """Remember the remaining hourly budget; the bucket refills 1/s."""
+        try:
+            self.remaining = int(headers["RateLimit-Remaining"])
+        except (KeyError, TypeError, ValueError):
+            pass
+
+    def wait(self):
+        """Sleep between polls, stretching when the budget runs low."""
+        nap = self.interval
+        if self.remaining is not None and self.remaining < self.reserve:
+            nap = max(nap, 30)
+            print(f"budget low: {self.remaining} left, polling every {nap}s", flush=True)
+        time.sleep(nap)
 
     def notify(self, text):
         print(text, flush=True)
@@ -101,6 +120,7 @@ class Sniper:
                     return 0
                 fails = 0  # only a fully clean pass clears the error counter
             except urllib.error.HTTPError as e:
+                self.note_limits(e.headers)
                 try:
                     err = json.load(e).get("error", {})
                 except Exception:
@@ -108,8 +128,11 @@ class Sniper:
                 if err.get("code") == "resource_unavailable":
                     print("race lost, retrying", flush=True)
                 elif e.code == 429:
-                    print("rate limited, backing off", flush=True)
-                    time.sleep(300)
+                    # The bucket refills one request per second, so seconds are
+                    # enough; RateLimit-Reset is full recovery, up to an hour off.
+                    print(f"rate limited, sleeping {self.backoff}s", flush=True)
+                    time.sleep(self.backoff)
+                    continue
                 else:
                     fails += 1
                     print("HTTP", e.code, err, flush=True)
@@ -118,7 +141,7 @@ class Sniper:
                                     f"{err.get('message')}")
             except Exception as e:  # network blip etc.
                 print("ERR", e, flush=True)
-            time.sleep(self.interval)
+            self.wait()
 
 
 if __name__ == "__main__":
